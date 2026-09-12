@@ -5811,6 +5811,13 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
                  # "draft" is the other half of the verb split — it DOES stay
                  # on the Mac, unsent in the owner's own outbox.
                  "unsent in their outbox",
+                 # This section renders on an email turn too, where the agent
+                 # has a native reply path (email.py's adapter posts to
+                 # /v1/chats/<id>/messages). So the email rule says what to DO
+                 # rather than enumerating what is reachable from where — an
+                 # enumeration is wrong in whichever context it wasn't written
+                 # for, and would suppress a legitimate reply.
+                 "answer where you already are",
                  # What the tools are for, in jobs rather than tool names, and
                  # that earlier agents' work persists on the Mac: an agent that
                  # knew only the possessive rule searched its own sessions for
