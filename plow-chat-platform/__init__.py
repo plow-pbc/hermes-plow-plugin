@@ -28,7 +28,7 @@ from typing import Any, Mapping
 
 import aiohttp
 import agent.redact as _hermes_redact
-from gateway.config import HomeChannel, Platform, persist_home_channel
+from gateway.config import Platform
 try:
     from gateway.deferred_questions import DeferredQuestionResult
 except ModuleNotFoundError:
@@ -1187,6 +1187,12 @@ _live = None  # tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None
 # slash command or change of speaker closes the burst, so command semantics
 # and a group's order are never reshuffled.
 INBOUND_DEBOUNCE_SECONDS = 2.0
+# The base spawns `_keep_typing` for every turn (`base.py:3993`) and ticks
+# `send_typing` every 2s; the provider lapses the indicator at 85-90s. One POST
+# a window holds it and the other ticks cost a dict lookup -- which is why no
+# peer passes `interval=`, and why photon (`:1198-1207`) and discord (`:3998`)
+# throttle in `send_typing` rather than beside it.
+TYPING_COOLDOWN_SECONDS = 60
 HAND_OFF_RETRY_SECONDS = 5.0
 
 
@@ -1220,6 +1226,12 @@ def _platform():
 
 
 class PlowChatAdapter(BasePlatformAdapter):
+    # Cron output past 4,000 chars is otherwise truncated with a footer naming
+    # a file inside the container, which the owner cannot open
+    # (`gateway/delivery.py:242`). `_post_message` caps nothing of its own and
+    # a refusal returns a loud SendResult failure, so take the whole payload.
+    splits_long_messages = True
+
     def __init__(self, config):
         super().__init__(config=config, platform=_platform())
         self._configured_home_chat_uid = os.environ["PLOW_HOME_CHANNEL"]
@@ -1252,7 +1264,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # pre-existing and never handed to hermes.
         self._anchored_chats = {self.home_chat_uid: CHECKPOINT.exists()}
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
-        self._typing = {}
+        self._typing_last_sent = {}           # chat uid -> when its last `start` went out
         self._goal_wakes = {}                 # chat uid -> the one task pacing its goal
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
         self._goal_paced = False              # pacing runs only inside a live socket session
@@ -1302,24 +1314,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._anchored_chats[chat_uid] = True
         return True
 
-    def _cancel_typing(self, chat_uid):
-        task = self._typing.pop(chat_uid, None)
-        if task:
-            task.cancel()
-
-    def _kick_typing(self, chat_uid, initial_delay=2.0):
-        """A message post just cleared the provider-side indicator, so if a
-        turn's typing loop is live, restart it — otherwise the indicator stays
-        dark until the loop's next 60s tick, or forever once cancelled. The
-        grace delay debounces multi-part sends and gives on_processing_complete
-        time to cancel a final-reply restart before it ever posts. Sequences use
-        zero grace so their reading pauses keep the indicator active."""
-        if chat_uid not in self._typing:
-            return
-        self._cancel_typing(chat_uid)
-        self._typing[chat_uid] = asyncio.create_task(
-            self._typing_until_reply(chat_uid, initial_delay=initial_delay))
-
     def _set_reach(self, chats):
         next_chats, foreign = _split(chats, PROVIDER)
         if not next_chats:
@@ -1333,8 +1327,6 @@ class PlowChatAdapter(BasePlatformAdapter):
                 f"configured home {self._configured_home_chat_uid} is not in the "
                 "credential grant -- fix PLOW_HOME_CHANNEL or the grant")
         next_home = self._configured_home_chat_uid
-        for chat_uid in self.chat_uids - next_chats.keys():
-            self._cancel_typing(chat_uid)
         self.home_chat_uid = next_home
         self._chats = next_chats
         self.chat_uids = frozenset(next_chats)
@@ -1423,14 +1415,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         except Exception as exc:             # noqa: BLE001 - never worth failing the connect
             log.info("[plow_chat] referrer read failed: %s: %s", type(exc).__name__, exc)
 
-    async def _persist_home(self):
-        """Declare the home channel used for cron and default delivery."""
-        chat = await self.get_chat_info(self.home_chat_uid)
-        persist_home_channel(
-            HomeChannel(platform=_platform(), chat_id=self.home_chat_uid,
-                        name=chat["name"]),
-            enabled_if_new=True)
-
     @property
     def authorization_is_upstream(self):
         """Plow authenticates members, so hermes must not gate on top.
@@ -1460,13 +1444,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             # turn refreshes -- see _owner_identity -- so it is not read here.
             if not is_reconnect:
                 await self._read_referrer(http)
-        # Declare the home channel, so the customer is never asked /sethome.
-        # config.yaml is the canonical store /sethome itself writes, and the
-        # cron scheduler reads it back via config.get_home_channel(). The home
-        # cannot move (a grant without it is refused above), so this is a
-        # first-connect write; a failure fails the connect, loudly.
-        if not is_reconnect:
-            await self._persist_home()
         # _live is published inside `_listen`, not here -- see its comment
         # for why publishing before that task has even run its first anchor
         # pass let a tool call race it.
@@ -1484,8 +1461,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         for _queue, server in self._inbound.values():
             server.cancel()                  # what it held unacked, the next backfill replays
         self._inbound.clear()
-        for chat_uid in tuple(self._typing):
-            self._cancel_typing(chat_uid)
         for task in tuple(self._sequences):
             task.cancel()
         self._sequence_turns.clear()
@@ -1494,8 +1469,6 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event):
         chat_uid = event.source.chat_id
-        self._cancel_typing(chat_uid)
-        self._typing[chat_uid] = asyncio.create_task(self._typing_until_reply(chat_uid))
         # Hermes builds its own events and swallows a raise here, so an
         # unstamped event is a speakerless wake read from nothing that can raise.
         if not hasattr(event, "authority"):
@@ -1553,7 +1526,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         # turn's own replies are still reachable.
         turn = self._active_turn.get()
         said = list(turn.get("said") or ()) if turn else []
-        self._cancel_typing(chat_uid)
         self._active_turn.set(None)
         # This turn's ownership and this turn's tasks: a completion that
         # reached for the chat's entry instead would retire whichever turn
@@ -1563,19 +1535,16 @@ class PlowChatAdapter(BasePlatformAdapter):
         for task, owner in tuple(self._sequences.items()):
             if owner is turn:
                 task.cancel()
-        # The final reply's kick may have re-raised the indicator after the
-        # reply cleared it; a start left alone lingers up to ~90s, so clear
-        # it. Short timeout: this rides the gateway's turn-completion path,
-        # and a hung provider must not stall it for minutes.
-        try:
-            async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=5)) as http:
-                await http.post(f"{BASE}/v1/chats/{chat_uid}/typing",
-                                json={"action": "stop"}, headers=self.auth)
-        except Exception as exc:                # noqa: BLE001 - best effort
-            log.debug("[plow_chat] typing stop: %s", exc)
-        # After the typing stop, never before: the judge is a network round
-        # trip and the indicator must not hang behind it.
+        # Before the judge, never after: it is a network round trip and the
+        # indicator must not hang behind it. Base fires this hook ahead of the
+        # `finally` that stops typing (`base.py:4044`/`:4072`), so its loop is
+        # still ticking -- the pause is what stops the next tick undoing this.
+        # Chat-global, unlike everything above it: a goal wake and an inbound
+        # turn can both be live here, so stopping on the first completion
+        # strips the survivor of its indicator for the rest of its run.
+        if not any(t.get("chat_uid") == chat_uid for t in self._sequence_turns.values()):
+            self.pause_typing_for_chat(chat_uid)
+            await self._stop_typing_quietly(chat_uid)
         try:
             await self._goal_after_turn(chat_uid, event, said)
         except Exception as exc:                # noqa: BLE001 - a goal must never break the turn
@@ -2058,7 +2027,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 log.info("[plow_chat] dropped %s for %s",
                          "diagnostic" if diagnostic else "mid-turn chatter", chat_id)
                 return SendResult(success=True)
-            result = await self._post_message(http, chat_id, {"body": body})
+            result = await self._post_message(http, chat_id, {"body": body}, metadata)
         if result.success:
             # Only once it lands: text that never reached the thread is not
             # something the agent said. This records the turn's reply to its
@@ -2311,26 +2280,23 @@ class PlowChatAdapter(BasePlatformAdapter):
                 if refused is not None:
                     return refused
                 # A mid-turn status must not eat the "working" signal it rides
-                # alongside — _post_message re-arms the indicator its delivery
+                # alongside — _post_message re-raises the indicator its delivery
                 # clears: a verbose assistant gets both, not one or the other.
-                return await self._post_message(http, chat_id, {"body": content.strip()})
+                return await self._post_message(http, chat_id, {"body": content.strip()}, metadata)
         # Key and chat only, never the content: status payloads carry upstream
         # provider detail with no non-secret guarantee, and this frame exists
         # to be dropped, not persisted into the journal.
         log.info("[plow_chat] dropped status frame %r for %s", status_key, chat_id)
         return SendResult(success=True)
 
-    async def _post_message(self, http, chat_id, payload):
+    async def _post_message(self, http, chat_id, payload, metadata=None):
         async with http.post(f"{BASE}/v1/chats/{chat_id}/messages",
                              json=payload, headers=self.auth) as resp:
             data = await resp.json(content_type=None)
             if resp.status >= 400:
                 return SendResult(success=False, error=f"Plow Chat {resp.status}: {data}")
-        # A delivered message cleared the provider-side typing indicator, so
-        # re-arm the turn's loop (if one is live) to keep "working" visible;
-        # a failed post cleared nothing and the running loop stays. For the
-        # final reply, on_processing_complete cancels the restart and stops it.
-        self._kick_typing(chat_id)
+        # A failed post cleared nothing, so only a delivered one re-raises.
+        self._retrigger_typing(chat_id, metadata)
         return SendResult(success=True, message_id=data.get("uid"))
 
     def _sequence_guard(self, turn):
@@ -2349,7 +2315,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 data = await resp.json(content_type=None)
                 if not isinstance(data.get("uid"), str) or not data["uid"]:
                     raise ValueError("missing message uid")
-            self._kick_typing(chat_uid, initial_delay=0.0)
+            self._retrigger_typing(chat_uid)
             # A sequence is a send path that reaches the thread, so it owes the
             # goal transcript what it delivered. Without this the judge scores a
             # turn whose text and photos it cannot see, spends an attempt, and
@@ -2621,29 +2587,47 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._set_reach(body["data"])
         return [chat for chat in listed if chat["chat_id"] in self.chat_uids]
 
-    async def _typing_until_reply(self, chat_uid, initial_delay=0.0):
-        """Hold the typing indicator for as long as the turn takes.
+    async def send_typing(self, chat_id, metadata=None):
+        now = time.monotonic()
+        if now - self._typing_last_sent.get(chat_id, 0.0) < TYPING_COOLDOWN_SECONDS:
+            return
+        self._typing_last_sent[chat_id] = now
+        await self._typing_post(chat_id, "start")
 
-        The indicator auto-clears server-side around 85-90s, so it is
-        refreshed inside that window; cancellation ends the loop, and every
-        message post restarts it via _kick_typing (with the grace
-        `initial_delay`), so the indicator survives mid-turn sends. A 424 is
-        a generic provider rejection, not a turn error, and is never allowed
-        to break a turn.
-        """
+    async def stop_typing(self, chat_id):
+        self._typing_last_sent.pop(chat_id, None)
+        await self._typing_post(chat_id, "stop")
+
+    async def _typing_post(self, chat_id, action):
+        """Best effort, and bounded: a 424 is a generic provider rejection
+        rather than a turn error, and the stop rides the gateway's
+        turn-completion path, which a hung provider must not stall."""
         try:
-            if initial_delay:
-                await asyncio.sleep(initial_delay)
-            async with aiohttp.ClientSession() as http:
-                while True:
-                    try:
-                        await http.post(f"{BASE}/v1/chats/{chat_uid}/typing",
-                                        json={"action": "start"}, headers=self.auth)
-                    except Exception as exc:        # noqa: BLE001 - best effort
-                        log.debug("[plow_chat] typing: %s", exc)
-                    await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            pass
+            async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=5)) as http:
+                await http.post(f"{BASE}/v1/chats/{chat_id}/typing",
+                                json={"action": action}, headers=self.auth)
+        except Exception as exc:                # noqa: BLE001 - best effort
+            log.debug("[plow_chat] typing %s: %s", action, exc)
+
+    def _retrigger_typing(self, chat_id, metadata=None):
+        """A delivered message clears the indicator; dropping the stamp lets the
+        base's next tick raise it again inside the cooldown window.
+
+        Deliberately NOT a send. Awaiting a POST here would sit between Plow
+        accepting the message and `_post_message` returning its `SendResult`:
+        a cancellation in that gap loses the success, the checkpoint never
+        advances, and the backfill replays a reply the thread already has.
+        The base loop owns the posting -- this only decides when it may.
+
+        Gated like `telegram._retrigger_typing` (`:3325-3331`): never after the
+        answer, and never outside the turn that owns this chat, whose refresh
+        loop is the only thing that would clear a bubble raised beside it.
+        """
+        turn = self._active_turn.get()
+        if (metadata or {}).get("notify") or turn is None or chat_id != turn["chat_uid"]:
+            return
+        self._typing_last_sent.pop(chat_id, None)
 
     async def get_chat_info(self, chat_id):
         chat = self._chats[chat_id]
@@ -4276,6 +4260,19 @@ def check_requirements():
                 and os.environ.get("PLOW_AGENT_TOKEN"))
 
 
+def _env_enablement():
+    """Declare the home channel from env, before any adapter is constructed.
+
+    `gateway/config_env.py:420-428` turns this into the platform's
+    `HomeChannel`, so cron and `hermes gateway status` both see it without the
+    first-connect config.yaml write it replaces. Nothing is read from the API:
+    the home cannot move (`_set_reach` refuses a grant without it) and its name
+    is the fixed, unsuffixed one `_resolve_chat_names` gives it.
+    """
+    home = os.environ.get("PLOW_HOME_CHANNEL")
+    return {"home_channel": {"chat_id": home, "name": HOME_CHAT_NAME}} if home else None
+
+
 def register(ctx):
     global _deferred_questions, _plugin_llm
     _plugin_llm = getattr(ctx, "llm", None)
@@ -4291,6 +4288,7 @@ def register(ctx):
         label="Plow Chat",
         adapter_factory=lambda cfg: PlowChatAdapter(cfg),
         check_fn=check_requirements,
+        env_enablement_fn=_env_enablement,
         cron_deliver_env_var="PLOW_HOME_CHANNEL",
         platform_hint="You are chatting over an iMessage/SMS-style Plow Chat "
                       "thread. Keep replies short; bold, italics and headings render, "
