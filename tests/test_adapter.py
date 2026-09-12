@@ -111,6 +111,7 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
             it ends in a plain `send()` forwarding whatever metadata it was
             given (base.py:2566), which is why the question needs a marker."""
             return await self.send(chat_id=chat_id, content=f"\u2753 {question}", metadata=metadata)
+
         # base.py:3015 / :3009 -- pause the turn-long refresh loop, then clear
         # the platform's own indicator, swallowing adapter errors.
         def pause_typing_for_chat(self, chat_id: str) -> None:
