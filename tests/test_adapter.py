@@ -4117,10 +4117,6 @@ async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_pu
     assert module._live is None
 
 
-async def _record_fatal(seen: list[Any], adapter: Any) -> None:
-    seen.append(adapter)
-
-
 @pytest.mark.parametrize(("status", "retries"), [
     pytest.param(401, False, id="revoked_is_terminal"),
     # A 403 is resource-scoped (removed from one chat) and a 502 in front of
@@ -4143,7 +4139,10 @@ async def test_ticket_mint_status_decides_terminal_vs_retry(
     # adapter and queues the reconnect (:302-330). Writing the status file is
     # not calling it -- an uninformed gateway stays up believing the line works.
     notified: list[Any] = []
-    adapter.set_fatal_error_handler(lambda failed: _record_fatal(notified, failed))
+    async def handler(failed: Any) -> None:
+        notified.append(failed)
+
+    adapter.set_fatal_error_handler(handler)
     calls: list[str] = []
     session = _Session(calls=calls)
     session.ticket_status = status

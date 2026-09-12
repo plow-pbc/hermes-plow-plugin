@@ -124,14 +124,11 @@ class PlowEmailAdapter(BasePlatformAdapter):
                     if frame.type == aiohttp.WSMsgType.TEXT:
                         await self._on_frame(frame.json(), http)
 
-        await _serve(session, self._mark_disconnected, PLATFORM_NAME,
-                     on_fatal=self._credential_refused)
+        await _serve(session, self._mark_disconnected, PLATFORM_NAME)
+        self._set_fatal_error(*CREDENTIAL_REFUSED, retryable=False)
         # The gateway learns this line is dead only here -- see `_serve` for
         # why the notify belongs to the task that owns the loop.
         await self._notify_fatal_error()
-
-    def _credential_refused(self):
-        self._set_fatal_error(*CREDENTIAL_REFUSED, retryable=False)
 
     async def send_clarify(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
         """Stamp the question so `_is_chatter` does not read it as prose. This

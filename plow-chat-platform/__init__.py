@@ -1431,9 +1431,6 @@ class PlowChatAdapter(BasePlatformAdapter):
                         name=chat["name"]),
             enabled_if_new=True)
 
-    def _credential_refused(self):
-        self._set_fatal_error(*CREDENTIAL_REFUSED, retryable=False)
-
     @property
     def authorization_is_upstream(self):
         """Plow authenticates members, so hermes must not gate on top.
@@ -2877,8 +2874,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # deliver instructions to stop it.
                     self._goal_pause_wakes()
 
-        await _serve(session, self._mark_disconnected, PLATFORM_NAME,
-                     on_fatal=self._credential_refused)
+        await _serve(session, self._mark_disconnected, PLATFORM_NAME)
+        self._set_fatal_error(*CREDENTIAL_REFUSED, retryable=False)
         # Terminal. State first (`_serve` marked us disconnected), then the
         # tool handle: a confirmed group send against a retired credential
         # must refuse, not invoke this adapter. (Re-port of #17.)

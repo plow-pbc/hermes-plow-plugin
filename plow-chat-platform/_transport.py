@@ -85,7 +85,7 @@ def _socket(http, ticket):
     return http.ws_connect(f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}", heartbeat=30)
 
 
-async def _serve(session, on_drop, tag, *, on_fatal):
+async def _serve(session, on_drop, tag):
     """The reconnect loop the chat adapter runs, written to be shared with
     the email platform tracked in plow-pbc/hermes-plugin-plow#109.
 
@@ -94,12 +94,12 @@ async def _serve(session, on_drop, tag, *, on_fatal):
     revoked credential: every retry would present the same dead token
     (observed on the str agent 2026-08-27 -- one WARNING a minute, the line
     dead, the adapter reporting itself connected). `on_drop` marks the
-    adapter disconnected on either exit; `on_fatal` records the terminal stop.
+    adapter disconnected on either exit.
 
-    `on_fatal` is SYNCHRONOUS on purpose. Telling the gateway is a second,
-    awaited step (`_notify_fatal_error`), and it belongs to whoever owns this
-    task -- awaiting it from in here would run the runner's handler, which
-    cancels this very task, inside the loop it is cancelling.
+    Returning IS the signal: a revoked credential is the only way out, so the
+    caller records the fatal state and tells the gateway itself. Doing that
+    from in here would run the runner's handler -- which cancels this very
+    task -- inside the loop it is cancelling.
     """
     while True:
         try:
@@ -109,7 +109,6 @@ async def _serve(session, on_drop, tag, *, on_fatal):
             log.error("[%s] credential refused (401) -- stopping the listen loop; "
                       "re-credential this agent", tag)
             on_drop()
-            on_fatal()
             return
         except Exception as exc:              # noqa: BLE001 - reconnect, never die
             # TYPE only: the ticket is a query parameter, so a non-101
