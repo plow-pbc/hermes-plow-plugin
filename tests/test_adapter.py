@@ -5794,7 +5794,18 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     assert text == module.LATCH_PROMPT
     assert len(text) <= 4000, "Hermes skips a section over max_chars"
     for must in ("Latch", "plow_list_skills", "plow_", "not connected",
-                 "plow_list_chats", "plow_send_message", "Messages app",
+                 "plow_list_chats", "plow_send_message",
+                 # Outbound goes out from the agent's own line, never the Mac:
+                 # driving Messages/Mail there sends AS the owner, from their
+                 # number and address, into a thread they are not seated in —
+                 # which is how a failed send got reported to an owner as
+                 # delivered, with no record on any surface they can see.
+                 # Both halves are pinned: the tool that opens the thread, and
+                 # the prohibition that stops the Mac fallback coming back.
+                 "plow_start_group_message", "AS your owner",
+                 # "draft" is the other half of the verb split — it DOES stay
+                 # on the Mac, unsent in the owner's own outbox.
+                 "unsent in their outbox",
                  # What the tools are for, in jobs rather than tool names, and
                  # that earlier agents' work persists on the Mac: an agent that
                  # knew only the possessive rule searched its own sessions for
