@@ -131,8 +131,10 @@ async def _serve(session, on_drop, on_connect, tag, *, on_fatal):
             log.warning("[%s] websocket error: %s", tag, type(exc).__name__)
         # Both endings, not just the raising one: a server-side CLOSE ends the
         # frame loop by returning, and leaving that path unmarked reported the
-        # line connected for the whole retry delay -- five minutes once the
-        # backoff saturates, where it used to be five seconds.
+        # line connected for the whole retry delay. That delay is 30s here, not
+        # the cap: a close means the socket was up, so `connected()` already
+        # reset the curve. Only repeated PRE-connect failures -- reach read,
+        # ticket mint, handshake -- ever climb to 300s.
         on_drop()
         attempt += 1
         await asyncio.sleep(_reconnect_backoff(attempt))
