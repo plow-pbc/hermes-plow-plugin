@@ -134,7 +134,11 @@ The model's own **mid-turn prose** is gated by the same setting, but only
 where someone else is listening. What counts as mid-turn is a metadata test,
 not a prefix one: Hermes marks the turn-final reply `notify` and a cron
 delivery `job_id`, and anything carrying neither, sent while a turn is open, is
-the model working out loud.
+the model working out loud. Two markers are read as questions rather than
+prose: `clarify_id` and `is_approval_prompt`. A blocking question is not
+working-out -- the turn stops until the room answers it -- and base's text
+fallback sends one carrying neither `notify` nor `job_id`, so without that
+carve-out it was withheld everywhere but the owner's own DM.
 
 **The answer goes last, and that is still a prompt rule, because the delivery
 seam can withhold prose but cannot recognise an answer.** Hermes reads whatever
@@ -210,8 +214,11 @@ and a text never renders as an email. Sessions are keyed
 address, read off the thread's own agent participant at connect. Replies go
 out through the same chat send endpoint — plow dispatches on the provider —
 with no approval gate: this is the agent's own line, like its number. Only
-the turn's answer, a cron delivery, or a turn-less send is ever mailed;
-mid-turn prose and the runtime's diagnostics are dropped. No cron home
+the turn's answer, a cron delivery, a turn-less send, or a blocking question
+(`clarify_id` / `is_approval_prompt`) is ever mailed; mid-turn prose and the
+runtime's diagnostics are dropped. This line has no owner-DM carve-out, so
+before that exception a question the turn was waiting on was dropped in
+every thread -- strictly worse here than on the phone line. No cron home
 (`PLOW_HOME_CHANNEL` stays the phone line's), no roster policy on
 multi-address threads, no backfill across a socket gap, and no delivered
 attachments in v1 — an attachment-only mail arrives as a placeholder naming
