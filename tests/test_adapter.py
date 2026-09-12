@@ -5803,6 +5803,11 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
                  # Both halves are pinned: the tool that opens the thread, and
                  # the prohibition that stops the Mac fallback coming back.
                  "plow_start_group_message", "AS your owner",
+                 # Opening a thread to text someone must not hand them the
+                 # owner's authority: `trusted` defaults to true, and the
+                 # routing above is what newly sends ordinary outreach through
+                 # that tool, so the prompt selects discretion explicitly.
+                 "trusted=false",
                  # "draft" is the other half of the verb split — it DOES stay
                  # on the Mac, unsent in the owner's own outbox.
                  "unsent in their outbox",
