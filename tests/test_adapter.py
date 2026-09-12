@@ -64,9 +64,7 @@ def _rendered(module: Any, prompt: str, name: Any, identity: Any) -> str:
 def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_questions: bool = True) -> Any:
     """Import the plugin against stub `gateway` modules."""
     config = types.ModuleType("gateway.config")
-    config.HomeChannel = lambda **kw: kw  # type: ignore[attr-defined]
     config.Platform = lambda name: name  # type: ignore[attr-defined]
-    config.persist_home_channel = lambda *a, **k: None  # type: ignore[attr-defined]
 
     base = types.ModuleType("gateway.platforms.base")
 
@@ -77,6 +75,8 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
         def __init__(self, *, config: Any, platform: Any) -> None:
             self.config = config
             self.platform = platform
+            # base.py:1901 -- chats whose indicator `_keep_typing` must skip.
+            self._typing_paused: set[str] = set()
 
         def build_source(self, **kw: Any) -> Any:
             return _AttrDict(platform=self.platform, **kw)
@@ -85,6 +85,15 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
 
         def _mark_connected(self) -> None: ...
         def _mark_disconnected(self) -> None: ...
+
+        # base.py:3015 / :3009 -- pause the turn-long refresh loop, then clear
+        # the platform's own indicator, swallowing adapter errors.
+        def pause_typing_for_chat(self, chat_id: str) -> None:
+            self._typing_paused.add(chat_id)
+
+        async def _stop_typing_quietly(self, chat_id: str, metadata: Any = None) -> None:
+            with contextlib.suppress(Exception):
+                await self.stop_typing(chat_id)
 
     base.BasePlatformAdapter = _Adapter  # type: ignore[attr-defined]
     base.MessageEvent = lambda **kw: _AttrDict(kw)  # type: ignore[attr-defined]
@@ -1289,6 +1298,10 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     assert module._SPEAKER_FACT not in owner_prompt, "the owner is not a member"
     assert "first-user onboarding" not in owner_prompt.lower()
     assert config.extra["group_sessions_per_user"] is False
+    # The base spawns `_keep_typing` for every turn (base.py:3993) and
+    # `typing_indicator=False` would stop it. This adapter drives that loop
+    # through `send_typing`/`stop_typing`, so switching it off goes dark.
+    assert not hasattr(config, "typing_indicator")
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_a"
     assert (tmp_path / "plow_chat_last_uid.cht_b").read_text() == "msg_b_member"
     assert "outside the grant" in caplog.text
@@ -1912,13 +1925,11 @@ async def test_a_grant_that_drops_the_configured_home_is_refused(
     """The home is where cron and the owner's default output land. When the
     grant no longer contains it, the old fallback adopted whichever chat the
     API listed first -- pointing owner-directed deliveries at an unrelated
-    room. The contract now is refusal: reach stays as it was, nothing is
-    persisted, and _listen retries with an error naming the fix."""
+    room. The contract now is refusal: reach stays as it was, and _listen
+    retries with an error naming the fix."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
-    persisted: list[dict[str, Any]] = []
-    monkeypatch.setattr(module, "persist_home_channel", lambda home, **kwargs: persisted.append(home))
 
     class _GrantHTTP:
         def get(self, url: str, **kwargs: Any) -> _Resp:
@@ -1928,7 +1939,6 @@ async def test_a_grant_that_drops_the_configured_home_is_refused(
         await adapter._refresh_reach(_GrantHTTP())
     assert adapter.home_chat_uid == "cht_a", "a refused grant must not move the home"
     assert adapter.chat_uids == frozenset({"cht_a", "cht_b"}), "a refused grant must not replace reach"
-    assert persisted == []
 
 
 @pytest.mark.parametrize(
@@ -2205,15 +2215,14 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     results["after_turn"] = await adapter.send("cht_a", "allowed after B", metadata={"notify": True})
     results["outside_grant"] = await adapter.send("cht_c", "not granted")
 
-    assert "cht_b" not in adapter._typing
     assert results["reply"].success
     assert not results["cross_chat"].success
     assert results["after_turn"].success
     assert not results["outside_grant"].success
     assert http.posts == [
         (f"{module.BASE}/v1/chats/cht_b/messages", {"body": "reply in B"}),
-        # Every turn completion clears the typing indicator the in-turn
-        # send's re-arm (or the loop's own refresh) may have left raised.
+        # Every turn completion clears the typing indicator the base's refresh
+        # loop was holding up -- before the goal judge's round trip, not after.
         (f"{module.BASE}/v1/chats/cht_b/typing", {"action": "stop"}),
         (f"{module.BASE}/v1/chats/cht_b/typing", {"action": "stop"}),
         (f"{module.BASE}/v1/chats/cht_a/messages", {"body": "allowed after B"}),
@@ -4309,63 +4318,122 @@ async def test_status_frames_follow_verbose_preference(
     iMessage thread as real messages (#30). Quiet is the default: dropped --
     the typing indicator already covers "working" -- and reported as success
     so the gateway never retries. Verbose delivers, and must not eat the
-    typing indicator: the message post clears the provider-side bubble, so
-    delivery re-arms the loop -- both signals, not one or the other. Quiet
-    leaves the running loop entirely untouched."""
+    indicator: the message post clears the provider-side bubble, so the
+    delivery re-raises it. Quiet touches the bubble not at all."""
     module = _load(monkeypatch, tmp_path)
     http = _SettingsHTTP(_me(verbose=enabled))
     adapter = _verbose_adapter(module, http, monkeypatch)
-    status = "✓ Context compaction complete — continuing turn..."
+    adapter._active_turn.set(
+        {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "no_reply_ok": False}
+    )
+    status = "\u2713 Context compaction complete \u2014 continuing turn..."
 
-    typing = asyncio.get_running_loop().create_future()
-    adapter._typing["cht_a"] = typing
     result = await adapter.send_or_update_status("cht_a", "compacted", status)
-    expected = [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})] if enabled else []
-    assert result.success and http.posts == expected
-    if enabled:
-        replacement = adapter._typing.get("cht_a")
-        assert replacement is not typing and typing.cancelled()
-        assert isinstance(replacement, asyncio.Task)
-        adapter._cancel_typing("cht_a")
-    else:
-        assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+
+    assert result.success
+    assert http.posts == ([
+        (f"{module.BASE}/v1/chats/cht_a/messages", {"body": status}),
+        (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}),
+    ] if enabled else [])
 
 
-async def test_mid_turn_sends_keep_the_typing_indicator_alive(
+async def test_send_typing_posts_once_per_cooldown_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The base ticks `send_typing` every 2s for the whole turn (base.py:3993).
+    The provider lapses the bubble at 85-90s, so one POST a window holds it and
+    the rest of the ticks are a dict lookup -- which is the whole reason no
+    peer passes `interval=`. With the window at zero every tick posts, which is
+    what makes the first half a claim about the comparison rather than luck."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    await adapter.send_typing("cht_a")
+    await adapter.send_typing("cht_a")
+    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"})]
+
+    monkeypatch.setattr(module, "TYPING_COOLDOWN_SECONDS", 0)
+    await adapter.send_typing("cht_a")
+    assert len(http.posts) == 2, "a window of zero must let every tick through"
+
+    await adapter.stop_typing("cht_a")
+    assert http.posts[-1] == (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "stop"})
+
+
+@pytest.mark.parametrize(
+    ("metadata", "in_turn", "posted", "rearmed"),
+    [
+        ({"thread_id": "t1"}, True, True, True),
+        ({"notify": True}, True, True, False),
+        ({"job_id": "j1"}, False, True, False),
+        (None, True, True, True),
+    ],
+    ids=["mid-turn", "the-answer", "cron", "no-metadata"],
+)
+async def test_a_delivered_message_re_raises_the_bubble_unless_it_is_the_answer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    metadata: dict[str, Any] | None,
+    in_turn: bool,
+    posted: bool,
+    rearmed: bool,
 ) -> None:
-    """In quiet mode the typing indicator is the only "working" signal, so it
-    must survive the whole turn: a delivered answer re-arms the refresh loop,
-    which posts a fresh `start` once the grace delay elapses (the message post
-    cleared the provider-side bubble); a quiet-held chatter send never touches
-    it; and a send outside any turn starts none."""
+    """The provider clears the indicator on every message post, so the post is
+    what has to put it back -- #57 fixed a real bug where it died permanently
+    on the first mid-turn send. The re-arm clears the cooldown stamp, so it
+    lands ahead of the window rather than waiting it out.
+
+    Two things it must NOT do. Not after the turn-final reply (`notify`):
+    nothing follows the answer, and base's own stop is already on its way --
+    this is `telegram`'s `_retrigger_typing` gate (`:3325-3331`), and it is
+    sharper than the 2.0s debounce it replaces, which raced turn completion.
+    And not outside the turn that owns the chat: a cron delivery has no
+    refresh loop behind it, so a bubble raised there is one nothing clears
+    until the provider lapses it 85-90s later."""
     module = _load(monkeypatch, tmp_path)
     http = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, http, monkeypatch)
+    if in_turn:
+        adapter._active_turn.set(
+            {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "no_reply_ok": False}
+        )
 
-    real_sleep = asyncio.sleep
+    result = await adapter.send("cht_a", "the body", metadata=metadata)
 
-    async def instant(_delay: float) -> None:
-        await real_sleep(0)
+    assert result.success
+    expected = [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": "the body"})] if posted else []
+    if rearmed:
+        expected.append((f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}))
+    assert http.posts == expected
 
-    monkeypatch.setattr(module.asyncio, "sleep", instant)
-    typing = asyncio.get_running_loop().create_future()
-    adapter._typing["cht_a"] = typing
 
-    held = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
-    assert held.success
-    assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+async def test_the_goal_judge_runs_with_the_indicator_already_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The judge is a network round trip, and the bubble must not hang behind
+    it. Base fires `on_processing_complete` from inside its try (base.py:4044),
+    BEFORE the `finally` that stops typing (:4072) -- so the loop is still
+    ticking when this hook runs, and clearing the indicator without pausing it
+    first would let the very next tick raise it again."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    seen_by_the_judge: list[Any] = []
 
-    sent = await adapter.send("cht_a", "the answer", metadata={"notify": True})
-    assert sent.success and typing.cancelled()
-    for _ in range(10):                      # let the re-armed loop run
-        await real_sleep(0)
-    adapter._cancel_typing("cht_a")
-    assert (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}) in http.posts
+    async def judge(chat_uid: str, event: Any, said: Any) -> None:
+        seen_by_the_judge.append(list(http.posts))
 
-    outside_turn = await adapter.send("cht_a", "cron delivery", metadata={"job_id": "job_1"})
-    assert outside_turn.success and "cht_a" not in adapter._typing
+    monkeypatch.setattr(adapter, "_goal_after_turn", judge)
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="cht_a"), message_id="", text="")
+
+    await adapter.on_processing_complete(event, None)
+
+    assert seen_by_the_judge == [[(f"{module.BASE}/v1/chats/cht_a/typing", {"action": "stop"})]]
+    assert "cht_a" in adapter._typing_paused, "a live refresh tick would undo the stop"
 
 
 @pytest.mark.parametrize(
@@ -6358,6 +6426,8 @@ class _SequenceHTTP:
 
     def post(self, url, **kwargs):
         self.calls.append(('post', url, kwargs))
+        if url.endswith('/typing'):
+            return _Resp({})             # its own endpoint, not part of the message script
         if url.endswith('/attachments'):
             return _Resp(dict(uid=f'att_{len(self.calls)}', upload_url='https://upload.invalid/cap', upload_headers={'X-Cap': 'yes'}))
         self.posts += 1
@@ -6441,16 +6511,17 @@ async def test_sequence_requires_a_live_solo_owner_turn(monkeypatch, tmp_path, f
 @pytest.mark.asyncio
 async def test_sequence_stack_order_pause_replaces_gap_and_upload_has_no_bearer(monkeypatch, tmp_path):
     module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
-    delays, kicks = [], []
+    delays = []
     async def sleep(seconds): delays.append(seconds)
     monkeypatch.setattr(module.asyncio, 'sleep', sleep)
-    monkeypatch.setattr(adapter, '_kick_typing', lambda chat, initial_delay=2.0: kicks.append((chat, initial_delay)))
     result = await adapter.send_sequence({'items': _intro_items()}, turn)
     sends = [k['json'] for method, url, k in http.calls if url.endswith('/messages')]
     assert sends[0] == {'body': 'Before'} and sends[2] == {'body': 'After'}
     assert len(sends[1]['attachment_uids']) == 4
     assert delays == [1.0, 4], 'explicit reading pause must not gain an extra ordinary gap'
-    assert kicks == [('cht_a', 0.0)] * 3, 'sequence typing must not wait out the ordinary final-send grace'
+    typing = [url for method, url, _k in http.calls if method == 'post' and url.endswith('/typing')]
+    assert typing == [f'{module.BASE}/v1/chats/cht_a/typing'] * 3, \
+        'every sequence post clears the provider bubble, so every one re-raises it'
     for method, url, kwargs in http.calls:
         assert kwargs['headers'] == ({'X-Cap': 'yes'} if method == 'put' else adapter.auth)
     assert result == {'success': True, 'failure': None, 'completed': [
@@ -6492,7 +6563,8 @@ async def test_sequence_parallel_calls_cannot_interleave(monkeypatch, tmp_path):
     requests = [{'items': [dict(type='text', body=n+'1'), dict(type='pause', seconds=0), dict(type='text', body=n+'2')]} for n in ('a','b')]
     results = await asyncio.gather(*(adapter.send_sequence(a, turn) for a in requests))
     assert all(r['success'] for r in results)
-    assert [k['json']['body'] for _, url, k in http.calls] == ['a1', 'a2', 'b1', 'b2']
+    assert [k['json']['body'] for _, url, k in http.calls if url.endswith('/messages')] \
+        == ['a1', 'a2', 'b1', 'b2']
 
 
 @pytest.mark.asyncio
@@ -6824,7 +6896,6 @@ async def test_overlapping_turns_keep_their_own_sequence_ownership(monkeypatch, 
     task = asyncio.ensure_future(running)
     adapter._sequences[task] = second
 
-    monkeypatch.setattr(adapter, '_cancel_typing', lambda *a, **k: None)
     monkeypatch.setattr(adapter, '_goal_after_turn', mock.AsyncMock())
     module._ACTIVE_TURN.set(first)
     event = SimpleNamespace(source=SimpleNamespace(chat_id='cht_a'), message_id='', text='')
