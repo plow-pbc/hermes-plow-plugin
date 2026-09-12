@@ -18,6 +18,7 @@ import pathlib
 import re
 import sys
 import threading
+import time
 import types
 import urllib.error
 from dataclasses import dataclass
@@ -4327,14 +4328,17 @@ async def test_status_frames_follow_verbose_preference(
         {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "no_reply_ok": False}
     )
     status = "\u2713 Context compaction complete \u2014 continuing turn..."
+    adapter._typing_last_sent["cht_a"] = time.monotonic()   # mid-window, so the clear is visible
 
     result = await adapter.send_or_update_status("cht_a", "compacted", status)
 
     assert result.success
+    # No typing frame rides the delivery: the stamp is cleared instead, and the
+    # base's next tick raises the bubble (see `_retrigger_typing`).
     assert http.posts == ([
         (f"{module.BASE}/v1/chats/cht_a/messages", {"body": status}),
-        (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}),
     ] if enabled else [])
+    assert ("cht_a" not in adapter._typing_last_sent) is enabled
 
 
 async def test_send_typing_posts_once_per_cooldown_window(
@@ -4363,12 +4367,12 @@ async def test_send_typing_posts_once_per_cooldown_window(
 
 
 @pytest.mark.parametrize(
-    ("metadata", "in_turn", "posted", "rearmed"),
+    ("metadata", "in_turn", "rearmed"),
     [
-        ({"thread_id": "t1"}, True, True, True),
-        ({"notify": True}, True, True, False),
-        ({"job_id": "j1"}, False, True, False),
-        (None, True, True, True),
+        ({"thread_id": "t1"}, True, True),
+        ({"notify": True}, True, False),
+        ({"job_id": "j1"}, False, False),
+        (None, True, True),
     ],
     ids=["mid-turn", "the-answer", "cron", "no-metadata"],
 )
@@ -4377,13 +4381,12 @@ async def test_a_delivered_message_re_raises_the_bubble_unless_it_is_the_answer(
     tmp_path: pathlib.Path,
     metadata: dict[str, Any] | None,
     in_turn: bool,
-    posted: bool,
     rearmed: bool,
 ) -> None:
     """The provider clears the indicator on every message post, so the post is
     what has to put it back -- #57 fixed a real bug where it died permanently
-    on the first mid-turn send. The re-arm clears the cooldown stamp, so it
-    lands ahead of the window rather than waiting it out.
+    on the first mid-turn send. Clearing the cooldown stamp is the whole of it:
+    the base's refresh loop owns the posting, and this decides when it may.
 
     Two things it must NOT do. Not after the turn-final reply (`notify`):
     nothing follows the answer, and base's own stop is already on its way --
@@ -4400,13 +4403,17 @@ async def test_a_delivered_message_re_raises_the_bubble_unless_it_is_the_answer(
             {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "no_reply_ok": False}
         )
 
+    adapter._typing_last_sent["cht_a"] = time.monotonic()   # mid-window: a tick would be throttled
+
     result = await adapter.send("cht_a", "the body", metadata=metadata)
 
     assert result.success
-    expected = [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": "the body"})] if posted else []
-    if rearmed:
-        expected.append((f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}))
-    assert http.posts == expected
+    # The delivery posts no typing frame of its own. Awaiting one here would sit
+    # between Plow accepting the message and `send` returning its result, where a
+    # cancellation loses the success and the backfill replays the reply.
+    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": "the body"})]
+    # What it changes is whether the base's next tick may raise the bubble again.
+    assert ("cht_a" not in adapter._typing_last_sent) is rearmed
 
 
 async def test_the_goal_judge_runs_with_the_indicator_already_stopped(
@@ -6520,8 +6527,9 @@ async def test_sequence_stack_order_pause_replaces_gap_and_upload_has_no_bearer(
     assert len(sends[1]['attachment_uids']) == 4
     assert delays == [1.0, 4], 'explicit reading pause must not gain an extra ordinary gap'
     typing = [url for method, url, _k in http.calls if method == 'post' and url.endswith('/typing')]
-    assert typing == [f'{module.BASE}/v1/chats/cht_a/typing'] * 3, \
-        'every sequence post clears the provider bubble, so every one re-raises it'
+    assert typing == [], 'a sequence post must not await a typing frame of its own'
+    assert 'cht_a' not in adapter._typing_last_sent, \
+        'every sequence post clears the provider bubble, so the next tick re-raises it'
     for method, url, kwargs in http.calls:
         assert kwargs['headers'] == ({'X-Cap': 'yes'} if method == 'put' else adapter.auth)
     assert result == {'success': True, 'failure': None, 'completed': [

@@ -1535,8 +1535,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         # indicator must not hang behind it. Base fires this hook ahead of the
         # `finally` that stops typing (`base.py:4044`/`:4072`), so its loop is
         # still ticking -- the pause is what stops the next tick undoing this.
-        self.pause_typing_for_chat(chat_uid)
-        await self._stop_typing_quietly(chat_uid)
+        # Chat-global, unlike everything above it: a goal wake and an inbound
+        # turn can both be live here, so stopping on the first completion
+        # strips the survivor of its indicator for the rest of its run.
+        if not any(t.get("chat_uid") == chat_uid for t in self._sequence_turns.values()):
+            self.pause_typing_for_chat(chat_uid)
+            await self._stop_typing_quietly(chat_uid)
         try:
             await self._goal_after_turn(chat_uid, event, said)
         except Exception as exc:                # noqa: BLE001 - a goal must never break the turn
@@ -2275,7 +2279,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             if resp.status >= 400:
                 return SendResult(success=False, error=f"Plow Chat {resp.status}: {data}")
         # A failed post cleared nothing, so only a delivered one re-raises.
-        await self._retrigger_typing(chat_id, metadata)
+        self._retrigger_typing(chat_id, metadata)
         return SendResult(success=True, message_id=data.get("uid"))
 
     def _sequence_guard(self, turn):
@@ -2294,7 +2298,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 data = await resp.json(content_type=None)
                 if not isinstance(data.get("uid"), str) or not data["uid"]:
                     raise ValueError("missing message uid")
-            await self._retrigger_typing(chat_uid)
+            self._retrigger_typing(chat_uid)
             # A sequence is a send path that reaches the thread, so it owes the
             # goal transcript what it delivered. Without this the judge scores a
             # turn whose text and photos it cannot see, spends an attempt, and
@@ -2589,19 +2593,24 @@ class PlowChatAdapter(BasePlatformAdapter):
         except Exception as exc:                # noqa: BLE001 - best effort
             log.debug("[plow_chat] typing %s: %s", action, exc)
 
-    async def _retrigger_typing(self, chat_id, metadata=None):
-        """A delivered message clears the indicator, so the post that cleared
-        it puts it back; dropping the stamp is what lets that past the window.
-        `telegram._retrigger_typing` (`:3325-3331`) is the same call, gated the
-        same way -- never after the answer, and never outside the turn that
-        owns this chat, whose refresh loop is the only thing that would clear a
-        bubble raised beside it.
+    def _retrigger_typing(self, chat_id, metadata=None):
+        """A delivered message clears the indicator; dropping the stamp lets the
+        base's next tick raise it again inside the cooldown window.
+
+        Deliberately NOT a send. Awaiting a POST here would sit between Plow
+        accepting the message and `_post_message` returning its `SendResult`:
+        a cancellation in that gap loses the success, the checkpoint never
+        advances, and the backfill replays a reply the thread already has.
+        The base loop owns the posting -- this only decides when it may.
+
+        Gated like `telegram._retrigger_typing` (`:3325-3331`): never after the
+        answer, and never outside the turn that owns this chat, whose refresh
+        loop is the only thing that would clear a bubble raised beside it.
         """
         turn = self._active_turn.get()
         if (metadata or {}).get("notify") or turn is None or chat_id != turn["chat_uid"]:
             return
         self._typing_last_sent.pop(chat_id, None)
-        await self.send_typing(chat_id, metadata=metadata)
 
     async def get_chat_info(self, chat_id):
         chat = self._chats[chat_id]
