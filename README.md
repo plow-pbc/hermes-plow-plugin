@@ -239,8 +239,10 @@ refused regardless of authority. Email sends and calendar-conflict overrides nee
 turn with the owner's authority; an email's approval posts in the room that asked,
 and an override posts none. A turn without authority cannot send to other chats, set
 goals, or list the owner's other rooms, and only the owner's own turn writes
-contacts. Groups the owner starts begin trusted; groups another member starts begin
-with discretion, and only the owner can change that later.
+contacts. A group the owner deliberately stands up to act on their behalf begins trusted;
+ordinary outreach the owner asks for — texting a contractor, a neighbour, a
+merchant — begins with discretion, as does a group another member starts. Only
+the owner can change that later.
 
 The `plow_set_conversation_trusted` tool writes the same API preference as the
 dashboard; opening a trusted thread is owner-only too. Both only succeed on an owner-
